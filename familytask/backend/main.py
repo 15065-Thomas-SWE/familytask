@@ -1,9 +1,13 @@
 import hashlib  # Importe le module permettant de calculer un hash SHA-256.
+import json  # Importe le décodeur JSON des arguments d'outil du modèle.
 import os  # Importe le module permettant de lire les variables d'environnement.
+import re  # Importe l'analyse simple des mots du message utilisateur.
 import secrets  # Importe le module permettant de générer des codes et des tokens aléatoires.
 
+import httpx  # Importe le client HTTP asynchrone utilisé pour appeler GitHub Models.
 from fastapi import Depends, FastAPI, Header, HTTPException  # Importe les dépendances FastAPI, la lecture des en-têtes et les erreurs HTTP.
 from fastapi.middleware.cors import CORSMiddleware  # Importe le middleware qui autorise les requêtes cross-origin.
+from sqlalchemy import inspect, text  # Importe les outils de migration légère du schéma existant.
 from sqlmodel import Field, Session, SQLModel, create_engine, select  # Importe les outils SQLModel nécessaires au modèle, aux sessions et aux requêtes.
 
 
@@ -63,10 +67,27 @@ engine = create_engine(DATABASE_URL)  # Crée le moteur de connexion à la base 
 app = FastAPI(title="FamilyTask")  # Crée l'application FastAPI avec son titre.
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])  # Autorise les requêtes provenant de toutes les origines.
 
+AI_URL = "https://models.github.ai/inference/chat/completions"
+AI_MODEL = "openai/gpt-4o-mini"
+AI_TOOLS = [{"type": "function", "function": {
+    "name": "ajouter_tache",
+    "description": "Ajoute une tâche à la liste d'une personne de la famille.",
+    "parameters": {"type": "object", "properties": {
+        "titre": {"type": "string"},
+        "personne": {"type": "string", "description": "Prénom de la personne"},
+    }, "required": ["titre", "personne"]},
+}}]
+
 
 @app.on_event("startup")  # Enregistre la fonction de création des tables pour le démarrage de l'application.
 def create_db_and_tables():  # Déclare la fonction exécutée au démarrage de l'application.
     SQLModel.metadata.create_all(engine)  # Crée les tables SQLModel qui n'existent pas encore.
+    task_columns = {column["name"] for column in inspect(engine).get_columns("task")}  # Lit les colonnes de la table existante.
+    with engine.begin() as connection:  # Ouvre une transaction de migration.
+        if "family_code" not in task_columns:  # Ajoute la colonne manquante des familles existantes.
+            connection.execute(text("ALTER TABLE task ADD COLUMN family_code VARCHAR"))
+        if "member_id" not in task_columns:  # Ajoute la colonne manquante du membre assigné.
+            connection.execute(text("ALTER TABLE task ADD COLUMN member_id INTEGER"))
 
 
 @app.get("/api/health")  # Déclare la route GET de contrôle de santé de l'application.
@@ -221,6 +242,90 @@ def create_task(title: str, member_id: int | None = None, member: Member = Depen
         session.commit()  # Enregistre la nouvelle tâche dans la base de données.
         session.refresh(task)  # Recharge la tâche pour obtenir son identifiant généré.
     return task  # Renvoie la tâche créée avec son identifiant.
+
+
+def ambiguous_family_link(message: str, members: list[Member]) -> tuple[str, list[Member]] | None:
+    words = set(re.findall(r"[A-Za-zÀ-ÿ]+", message.lower()))
+    links = {item.lien.strip().lower() for item in members if item.lien.strip()}
+    for link in links:
+        singular = link.rstrip("s")
+        if link not in words and singular not in words and f"{singular}s" not in words:
+            continue
+        matches = [item for item in members if item.lien.strip().lower() == link]
+        if len(matches) > 1:
+            return link if link.endswith("s") else f"{link}s", matches
+    return None
+
+
+@app.post("/api/assistant")
+async def assistant(message: str, member: Member = Depends(current_member)):
+    token = os.getenv("AI_TOKEN", "").strip()
+    if not token:
+        return {"reply": "L'assistant IA n'est pas configuré : la clé AI_TOKEN est absente."}
+
+    with Session(engine) as session:
+        family_members = session.exec(select(Member).where(Member.family_code == member.family_code)).all()
+
+    ambiguous = ambiguous_family_link(message, family_members)
+    if ambiguous:
+        link, matches = ambiguous
+        names = ", ".join(item.name for item in matches)
+        return {"reply": f"Il y a plusieurs {link} ({names}). Pour qui ?"}
+
+    roster = ", ".join(f"{item.name} ({item.lien})" for item in family_members)
+    payload = {
+        "model": AI_MODEL,
+        "messages": [
+            {"role": "system", "content": f"La personne connectée est {member.name}. Membres de la famille : {roster}. Utilise ajouter_tache pour créer une tâche et mets toujours le prénom exact dans personne. Pour une demande 'pour moi', utilise le prénom de la personne connectée."},
+            {"role": "user", "content": message},
+        ],
+        "tools": AI_TOOLS,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                AI_URL,
+                headers={"Authorization": f"Bearer {token}"},
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+    except httpx.HTTPError as error:
+        raise HTTPException(status_code=502, detail="L'assistant IA est indisponible") from error
+
+    model_message = (data.get("choices") or [{}])[0].get("message", {}) or {}
+    tool_calls = model_message.get("tool_calls") or []
+    if not tool_calls:
+        return {"reply": model_message.get("content", "")}
+
+    confirmations = []
+    with Session(engine) as session:
+        family_members = session.exec(select(Member).where(Member.family_code == member.family_code)).all()
+        for tool_call in tool_calls:
+            function = tool_call.get("function", {})
+            if function.get("name") != "ajouter_tache":
+                continue
+            arguments = function.get("arguments", {})
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError as error:
+                    raise HTTPException(status_code=502, detail="Arguments d'outil invalides") from error
+            if not isinstance(arguments, dict):
+                raise HTTPException(status_code=502, detail="Arguments d'outil invalides")
+
+            title = str(arguments.get("titre", "")).strip()
+            person_name = str(arguments.get("personne", "")).strip().casefold()
+            target = member if person_name in {"moi", "je", "moi-même", "moi meme"} else next(
+                (item for item in family_members if item.name.strip().casefold() == person_name),
+                None,
+            )
+            if not title or target is None:
+                raise HTTPException(status_code=422, detail="Le titre ou le prénom est invalide")
+            session.add(Task(family_code=member.family_code, member_id=target.id, title=title, done=False))
+            confirmations.append(f'Tâche ajoutée pour {target.name} : "{title}"')
+        session.commit()
+    return {"reply": " ".join(confirmations) or "Aucune tâche à ajouter."}
 
 
 @app.patch("/api/tasks/{id}")  # Déclare la route PATCH qui permet de basculer l'état d'une tâche.

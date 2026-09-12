@@ -4,6 +4,7 @@ import Login from './views/Login.vue'
 import Signup from './views/Signup.vue'
 import TasksView from './views/TasksView.vue'
 import FamilyView from './views/FamilyView.vue'
+import AssistantView from './views/AssistantView.vue'
 
 // Décrit les écrans accessibles dans l'application.
 const routes = [
@@ -11,6 +12,7 @@ const routes = [
   { path: '/login', component: Login },
   { path: '/signup', component: Signup },
   { path: '/tasks', component: TasksView, meta: { requiresAuth: true } },
+  { path: '/assistant', component: AssistantView, meta: { requiresAuth: true } },
   { path: '/famille', component: FamilyView, meta: { requiresAuth: true, requiresAdmin: true } },
   { path: '/taches', redirect: '/tasks' },
 ]
